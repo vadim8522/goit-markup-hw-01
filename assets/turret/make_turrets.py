@@ -1,14 +1,20 @@
 """Turrets levels 1-8: hex base, half-sphere dome, neon accents, growing barrel count/detail.
-Run: python make_turrets.py [levels...]   (needs the bpy and pillow pip packages)
+Run: python make_turrets.py -- [classic|winter] [levels...]   (needs the bpy and pillow pip packages)
 Outputs lvlN/turret_lvlN.fbx|glb + previews and lineup.png next to this script.
 Neon parts are separate objects named Neon_* (become Neon-material MeshParts in Roblox).
 Barrels point along +Y.
 """
 import bpy, bmesh, math, os, sys
 
-OUT = os.path.dirname(os.path.abspath(__file__))
-NEON = (0.0, 0.9, 1.0)
+ROOT = os.path.dirname(os.path.abspath(__file__))
+OUT = ROOT
 R = math.radians
+THEME = "classic"
+PALETTES = {
+    "classic": dict(neon=(0.0, 0.9, 1.0), steel=(0.16, 0.18, 0.22), dark=(0.07, 0.08, 0.10), trim=(0.30, 0.33, 0.38)),
+    # winter: frosted blue-grey metal, icy neon, plus white snow and pale ice props
+    "winter": dict(neon=(0.1, 0.65, 1.0), steel=(0.38, 0.46, 0.58), dark=(0.14, 0.19, 0.28), trim=(0.62, 0.70, 0.80)),
+}
 # size multiplier per level
 SCALE = {1: 1.0, 2: 1.0, 3: 1.05, 4: 1.25, 5: 1.3, 6: 1.4, 7: 1.5, 8: 1.6}
 
@@ -30,10 +36,13 @@ def mat(name, color, emit=0.0, rough=0.55, metal=0.4):
 class Builder:
     def __init__(self):
         self.parts = []
-        self.steel = mat("Steel", (0.16, 0.18, 0.22))
-        self.dark = mat("DarkMetal", (0.07, 0.08, 0.10))
-        self.trim = mat("Trim", (0.30, 0.33, 0.38))
-        self.neon = mat("Neon", NEON, emit=2.5)
+        pal = PALETTES[THEME]
+        self.steel = mat("Steel", pal["steel"])
+        self.dark = mat("DarkMetal", pal["dark"])
+        self.trim = mat("Trim", pal["trim"])
+        self.neon = mat("Neon", pal["neon"], emit=2.5)
+        self.snow = mat("Snow", (0.95, 0.97, 1.0), rough=0.9, metal=0.0)
+        self.ice = mat("Ice", (0.65, 0.86, 1.0), rough=0.2, metal=0.1)
         self.n = 0
 
     def _fin(self, obj, m, name):
@@ -92,6 +101,8 @@ class Builder:
         Y = R(90)
         if mount:
             self.box("BarrelMount", (r * 4.4 if level > 1 else 0.7, 0.5, 0.45), (x, y0, z), d)
+            if THEME == "winter":
+                self.box("SnowCap", (r * 4.4 if level > 1 else 0.7, 0.55, 0.08), (x, y0, z + 0.24), self.snow)
         if level == 1:
             self.cyl("Barrel", r, length, (x, y0 + length / 2, z), st, rot=(Y, 0, 0))
             self.cyl("Muzzle", r * 1.5, 0.3, (x, y0 + length - 0.1, z), d, rot=(Y, 0, 0))
@@ -112,6 +123,9 @@ class Builder:
         for s in (-1, 1):
             self.box("Neon_Vent", (0.04, 0.22, r * 0.6), (x + s * r * 1.55, my, z), nm)
         self.cyl("Neon_MuzzleTip", r * 0.7, 0.05, (x, my + 0.23, z), nm, verts=8, rot=(Y, 0, 0))
+        if THEME == "winter":
+            for dx, dy, h in ((-0.5, -0.1, 0.28), (0.45, 0.1, 0.2)):
+                self.cone("Icicle", r * 0.45, 0.0, h, (x + dx * r * 2, my + dy, z - r * 1.75 - h / 2), self.ice, verts=5, rot=(R(180), 0, 0))
 
 
 def build(level):
@@ -199,7 +213,35 @@ def build(level):
         b.ico("Neon_CoreCrystal", 0.22, (0, -0.2, 2.35), nm, scale=(1, 1, 1.6))
         b.cyl("Neon_CoreRing", 0.5, 0.04, (0, -0.2, 2.0), nm, verts=12)
         b.cyl("Neon_BaseRing2", 1.62, 0.04, (0, 0, 0.12), nm, verts=12)
+    if THEME == "winter":
+        winter_details(b, level)
     return b.parts
+
+
+def winter_details(b, level):
+    sn, ice = b.snow, b.ice
+    # snow blanket on the back of the dome, mounds on the base between the pylons
+    b.ico("SnowBlanket", 0.62, (0, -0.62, 1.05), sn, scale=(1.15, 1.0, 0.45))
+    for k in range(6):
+        a = R(k * 60 + 30)
+        b.ico("SnowMound", 0.28, (1.3 * math.cos(a), 1.3 * math.sin(a), 0.4), sn, scale=(1.2, 1.2, 0.5))
+    # ice crystals around the base rim
+    for k in range(6):
+        a = R(k * 60 + 30)
+        b.cone("IceSpike", 0.14, 0.0, 0.55 + 0.1 * (k % 2), (1.72 * math.cos(a), 1.72 * math.sin(a), 0.3), ice, verts=5)
+    if level >= 3:
+        b.ico("SnowCupola", 0.4, (0, -0.2, 1.4), sn, scale=(1.0, 1.0, 0.4))
+        for s_ in (-1, 1):
+            b.box("SnowBag", (0.34, 0.64, 0.07), (s_ * 1.25, -0.45, 0.8), sn)
+    if level >= 5:
+        b.cyl("SnowDish", 0.3, 0.05, (0.55, -0.55, 1.89), sn, verts=12, rot=(R(-35), 0, 0))
+    if level >= 7:
+        for s_ in (-1, 1):
+            b.box("SnowPod", (0.68, 0.96, 0.08), (s_ * 1.25, 0.35, 1.29), sn)
+    if level >= 8:
+        for k in range(4):
+            a = R(k * 90 + 45)
+            b.cone("IceCrown", 0.1, 0.0, 0.35, (0.8 * math.cos(a), 0.8 * math.sin(a) - 0.2, 1.3), ice, verts=5, rot=(0, 0, 0))
 
 
 def scale_parts(parts, s):
@@ -263,7 +305,10 @@ def montage(levels):
 
 
 if __name__ == "__main__":
-    levels = [int(a) for a in sys.argv[sys.argv.index("--") + 1:]] if "--" in sys.argv else list(range(1, 9))
+    args = sys.argv[sys.argv.index("--") + 1:] if "--" in sys.argv else []
+    THEME = next((a for a in args if a in PALETTES), "classic")
+    OUT = ROOT if THEME == "classic" else os.path.join(ROOT, THEME)
+    levels = [int(a) for a in args if a.isdigit()] or list(range(1, 9))
     for lv in levels:
         bpy.ops.wm.read_factory_settings(use_empty=True)
         parts = build(lv)
