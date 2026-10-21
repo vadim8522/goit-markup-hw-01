@@ -14,3 +14,11 @@ Specialist subagents live in `.claude/agents/`. Delegate by area:
 - `roblox-dev:roblox-reviewer`: read-only audit of security, DataStores, performance
 
 For large work, start with `architect` for a plan, then hand steps to the specialists.
+
+## Rules for the agent roster
+
+- Keep the roster small (aim for ~8-12 agents, never dozens).
+- Add a new agent only when an existing one is clearly overloaded, covers two unrelated areas, or a separate agent would be cheaper or better (e.g. a distinct recurring area such as audio, data/persistence, shop/monetization).
+- Before adding one, check that no existing agent can take the job, and tell the user what was added and why.
+- Prefer merging or removing agents that are rarely used.
+- Plans for big prompts go in `PLAN.md`; each new session reads it first.
