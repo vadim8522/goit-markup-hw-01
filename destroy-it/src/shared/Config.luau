@@ -58,6 +58,13 @@ Config.BUILDING_BONUS = 0.5
 -- Rebirth: скидає прогрес, але кожен ребьорт дає +1 до множника грошей (x2, x3, ...)
 Config.REBIRTH_PRICE = 1000000 -- ціна першого, далі множиться на номер ребьорту
 
+-- Gamepass "Auto-Sell": гроші одразу йдуть на баланс, сумка не потрібна.
+-- Створи gamepass на сайті Roblox (Creator Hub -> твоя гра -> Monetization -> Passes) і встав сюди його ID.
+Config.AUTO_SELL_PASS_ID = 0
+
+-- Адміни (UserId), яким дозволені команди !money і т.д. Автор гри і Studio дозволені завжди.
+Config.ADMINS = {}
+
 function Config.multiplier(rebirths: number): number
 	return 1 + rebirths
 end

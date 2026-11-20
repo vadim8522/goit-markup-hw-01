@@ -5,6 +5,7 @@ local RunService = game:GetService("RunService")
 local Debris = game:GetService("Debris")
 local Lighting = game:GetService("Lighting")
 local DataStoreService = game:GetService("DataStoreService")
+local MarketplaceService = game:GetService("MarketplaceService")
 
 local Config = require(ReplicatedStorage:WaitForChild("Config"))
 
@@ -337,6 +338,7 @@ type Data = {
 	zones: { boolean },
 	rebirths: number,
 	destroyed: number,
+	autoSell: boolean,
 }
 
 local data: { [Player]: Data } = {}
@@ -356,7 +358,7 @@ local function freshData(rebirths: number, destroyed: number): Data
 	for i in Config.Zones do
 		zones[i] = i == 1
 	end
-	return { money = 0, bag = 0, bagLevel = 1, weapon = 1, weapons = weapons, zones = zones, rebirths = rebirths, destroyed = destroyed }
+	return { money = 0, bag = 0, bagLevel = 1, weapon = 1, weapons = weapons, zones = zones, rebirths = rebirths, destroyed = destroyed, autoSell = false }
 end
 
 -- акуратно переносимо збережене в нову структуру (якщо змінився Config — нічого не зламається)
@@ -457,6 +459,10 @@ Players.PlayerAdded:Connect(function(plr)
 	-- якщо завантажити не вдалося, граємо без збереження, щоб не затерти старий прогрес
 	canSave[plr] = ok
 	data[plr] = fromSaved(saved)
+	if Config.AUTO_SELL_PASS_ID ~= 0 then
+		local owns, result = pcall(MarketplaceService.UserOwnsGamePassAsync, MarketplaceService, plr.UserId, Config.AUTO_SELL_PASS_ID)
+		data[plr].autoSell = owns and result == true
+	end
 	sendState(plr)
 	if not ok then
 		notify(plr, "Progress will not save this session")
@@ -508,6 +514,11 @@ local function addToBag(plr: Player, amount: number, pos: Vector3, text: string?
 		return
 	end
 	amount = math.floor(amount * Config.multiplier(d.rebirths))
+	if d.autoSell then
+		d.money += amount
+		EarnedRemote:FireClient(plr, pos, amount, text)
+		return
+	end
 	local free = Config.Bags[d.bagLevel].capacity - d.bag
 	if free <= 0 then
 		notify(plr, "Bag is full! Go SELL at spawn")
@@ -696,6 +707,7 @@ BuyRemote.OnServerEvent:Connect(function(plr, kind, index)
 			notify(plr, "Rebirth costs $" .. price)
 		else
 			data[plr] = freshData(d.rebirths + 1, d.destroyed)
+			data[plr].autoSell = d.autoSell
 			notify(plr, "REBIRTH! Money x" .. Config.multiplier(d.rebirths + 1))
 			-- стіни знову закриті: перезапускаємо персонажа, щоб клієнт оновив їх
 			plr:LoadCharacter()
@@ -726,5 +738,159 @@ for _, gate in gates:GetChildren() do
 			notify(plr, zone.name .. " unlocked!")
 			sendState(plr)
 		end
+	end)
+end
+
+---------------------------------------------------------------- Gamepass: Auto-Sell
+MarketplaceService.PromptGamePassPurchaseFinished:Connect(function(plr, passId, purchased)
+	local d = data[plr]
+	if d and purchased and passId == Config.AUTO_SELL_PASS_ID and passId ~= 0 then
+		d.autoSell = true
+		d.money += d.bag
+		d.bag = 0
+		notify(plr, "Auto-Sell activated! Money goes straight to your balance")
+		sendState(plr)
+	end
+end)
+
+---------------------------------------------------------------- Таблиця лідерів біля спавну
+-- Глобальна (усі сервери) через OrderedDataStore; якщо недоступна, показує гравців цього сервера.
+local board = box(Vector3.new(16, 20, 1), Vector3.new(-78, 10, 0), Color3.fromRGB(27, 42, 53))
+board.CFrame = CFrame.lookAt(board.Position, board.Position + Vector3.new(1, 0, 0))
+local surface = Instance.new("SurfaceGui")
+surface.Face = Enum.NormalId.Front
+surface.CanvasSize = Vector2.new(400, 500)
+surface.Parent = board
+local boardTitle = Instance.new("TextLabel")
+boardTitle.Size = UDim2.new(1, 0, 0, 60)
+boardTitle.BackgroundTransparency = 1
+boardTitle.Font = Enum.Font.FredokaOne
+boardTitle.TextScaled = true
+boardTitle.TextColor3 = Color3.fromRGB(255, 204, 77)
+boardTitle.Text = "MOST DESTROYED"
+boardTitle.Parent = surface
+local rows = {}
+for i = 1, 10 do
+	local row = Instance.new("TextLabel")
+	row.Size = UDim2.new(1, -20, 0, 40)
+	row.Position = UDim2.fromOffset(10, 60 + (i - 1) * 43)
+	row.BackgroundTransparency = 1
+	row.Font = Enum.Font.FredokaOne
+	row.TextScaled = true
+	row.TextXAlignment = Enum.TextXAlignment.Left
+	row.TextColor3 = if i == 1 then Color3.fromRGB(255, 215, 0) elseif i <= 3 then Color3.fromRGB(220, 220, 230) else Color3.new(1, 1, 1)
+	row.Text = ""
+	row.Parent = surface
+	rows[i] = row
+end
+
+local ordered: OrderedDataStore? = nil
+pcall(function()
+	ordered = DataStoreService:GetOrderedDataStore("DestroyIt_Destroyed_v1")
+end)
+local names: { [number]: string } = {}
+local function nameOf(userId: number): string
+	if not names[userId] then
+		local ok, name = pcall(Players.GetNameFromUserIdAsync, Players, userId)
+		names[userId] = if ok then name else "Player"
+	end
+	return names[userId]
+end
+
+local function refreshBoard()
+	local entries = {}
+	local ok = false
+	if ordered then
+		-- записуємо результати тих, хто зараз у грі
+		for plr, d in data do
+			pcall(function()
+				(ordered :: OrderedDataStore):SetAsync("p_" .. plr.UserId, math.floor(d.destroyed))
+			end)
+		end
+		ok = pcall(function()
+			local page = (ordered :: OrderedDataStore):GetSortedAsync(false, 10):GetCurrentPage()
+			for _, item in page do
+				local id = tonumber(string.sub(item.key, 3))
+				if id then
+					table.insert(entries, { name = nameOf(id), value = item.value })
+				end
+			end
+		end)
+	end
+	if not ok then
+		entries = {}
+		for plr, d in data do
+			table.insert(entries, { name = plr.Name, value = d.destroyed })
+		end
+		table.sort(entries, function(a, b)
+			return a.value > b.value
+		end)
+	end
+	for i, row in rows do
+		local e = entries[i]
+		row.Text = if e then i .. ". " .. e.name .. "  " .. e.value else ""
+	end
+end
+
+task.spawn(function()
+	while true do
+		refreshBoard()
+		task.wait(60)
+	end
+end)
+
+---------------------------------------------------------------- Адмін-команди (для тестування)
+-- Пиши в чат: !money 100000, !unlock, !weapons, !bag, !autosell, !reset
+local function isAdmin(plr: Player): boolean
+	return RunService:IsStudio() or plr.UserId == game.CreatorId or table.find(Config.ADMINS, plr.UserId) ~= nil
+end
+
+local commands = {
+	money = function(d: Data, arg: string?)
+		d.money += tonumber(arg) or 100000
+	end,
+	unlock = function(d: Data)
+		for i in d.zones do
+			d.zones[i] = true
+		end
+	end,
+	weapons = function(d: Data)
+		for i in d.weapons do
+			d.weapons[i] = true
+		end
+	end,
+	bag = function(d: Data)
+		d.bagLevel = #Config.Bags
+	end,
+	autosell = function(d: Data)
+		d.autoSell = not d.autoSell
+	end,
+}
+
+local function onChat(plr: Player, message: string)
+	local cmd, arg = string.match(string.lower(message), "^!(%w+)%s*(%S*)")
+	if not cmd or not isAdmin(plr) then
+		return
+	end
+	if cmd == "reset" then
+		data[plr] = freshData(0, 0)
+	elseif commands[cmd] and data[plr] then
+		commands[cmd](data[plr], arg)
+	else
+		notify(plr, "Commands: !money N, !unlock, !weapons, !bag, !autosell, !reset")
+		return
+	end
+	notify(plr, "Admin: " .. cmd .. " done")
+	sendState(plr)
+end
+
+Players.PlayerAdded:Connect(function(plr)
+	plr.Chatted:Connect(function(message)
+		onChat(plr, message)
+	end)
+end)
+for _, plr in Players:GetPlayers() do
+	plr.Chatted:Connect(function(message)
+		onChat(plr, message)
 	end)
 end

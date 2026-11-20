@@ -5,6 +5,7 @@ local RunService = game:GetService("RunService")
 local UserInputService = game:GetService("UserInputService")
 local ProximityPromptService = game:GetService("ProximityPromptService")
 local TweenService = game:GetService("TweenService")
+local MarketplaceService = game:GetService("MarketplaceService")
 
 local Config = require(ReplicatedStorage:WaitForChild("Config"))
 local remotes = ReplicatedStorage:WaitForChild("Remotes")
@@ -111,7 +112,7 @@ end
 
 -- крамниця
 local shop = new("Frame", {
-	Size = UDim2.fromOffset(560, 440), Position = UDim2.new(0.5, -280, 0.5, -220),
+	Size = UDim2.fromOffset(560, 500), Position = UDim2.new(0.5, -280, 0.5, -250),
 	BackgroundColor3 = DARK, Visible = false, Parent = gui,
 })
 corner(shop)
@@ -134,7 +135,7 @@ local function column(title: string, x: number): Frame
 		TextColor3 = Color3.new(1, 1, 1), Font = FONT, TextSize = 22, Text = title, Parent = shop,
 	})
 	local list = new("Frame", {
-		Size = UDim2.new(0.5, -20, 1, -150), Position = UDim2.new(x, 10, 0, 80), BackgroundTransparency = 1, Parent = shop,
+		Size = UDim2.new(0.5, -20, 1, -210), Position = UDim2.new(x, 10, 0, 80), BackgroundTransparency = 1, Parent = shop,
 	})
 	new("UIListLayout", { Padding = UDim.new(0, 6), Parent = list })
 	return list
@@ -165,12 +166,29 @@ end
 
 -- ребьорт: скидає прогрес, але гроші множаться
 local rebirthBtn = new("TextButton", {
-	Size = UDim2.new(1, -20, 0, 50), Position = UDim2.new(0, 10, 1, -60), BackgroundColor3 = Color3.fromRGB(150, 60, 220),
+	Size = UDim2.new(1, -20, 0, 50), Position = UDim2.new(0, 10, 1, -116), BackgroundColor3 = Color3.fromRGB(150, 60, 220),
 	TextColor3 = Color3.new(1, 1, 1), Font = FONT, TextSize = 18, Text = "REBIRTH", Parent = shop,
 })
 corner(rebirthBtn)
 rebirthBtn.Activated:Connect(function()
 	BuyRemote:FireServer("rebirth", 0)
+end)
+
+-- gamepass Auto-Sell (за Robux)
+local autoSellBtn = new("TextButton", {
+	Size = UDim2.new(1, -20, 0, 50), Position = UDim2.new(0, 10, 1, -60), BackgroundColor3 = Color3.fromRGB(0, 170, 90),
+	TextColor3 = Color3.new(1, 1, 1), Font = FONT, TextSize = 18, Text = "AUTO-SELL (Robux): money goes straight to balance", Parent = shop,
+})
+corner(autoSellBtn)
+autoSellBtn.Activated:Connect(function()
+	if state and state.autoSell then
+		return
+	end
+	if Config.AUTO_SELL_PASS_ID == 0 then
+		toast.Text = "Auto-Sell gamepass is not set up yet"
+		return
+	end
+	MarketplaceService:PromptGamePassPurchase(player, Config.AUTO_SELL_PASS_ID)
 end)
 
 ---------------------------------------------------------------- State updates
@@ -224,6 +242,11 @@ local function render(newState)
 	local bag = Config.Bags[state.bagLevel]
 	bagLabel.Text = bag.name .. ": " .. short(state.bag) .. " / " .. short(bag.capacity)
 	barFill.Size = UDim2.fromScale(math.clamp(state.bag / bag.capacity, 0, 1), 1)
+	if state.autoSell then
+		bagLabel.Text = "AUTO-SELL ON"
+		barFill.Size = UDim2.fromScale(1, 1)
+	end
+	autoSellBtn.Text = if state.autoSell then "AUTO-SELL: OWNED" else "AUTO-SELL (Robux): money goes straight to balance"
 	barFill.BackgroundColor3 = if state.bag >= bag.capacity then Color3.fromRGB(255, 70, 70) else Color3.fromRGB(255, 204, 77)
 
 	for i, weapon in Config.Weapons do
