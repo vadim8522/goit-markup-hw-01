@@ -8,6 +8,7 @@ local DataStoreService = game:GetService("DataStoreService")
 local MarketplaceService = game:GetService("MarketplaceService")
 
 local Config = require(ReplicatedStorage:WaitForChild("Config"))
+local Landmarks = require(script:WaitForChild("Landmarks"))
 
 local B = Config.BLOCK
 local SIZE = Config.ZONE_SIZE
@@ -230,6 +231,29 @@ local function buildFence(zone: number, center: Vector3, half: number, side: num
 	buildingValue[id] = math.floor(count * Config.Zones[zone].value * Config.BUILDING_BONUS)
 end
 
+-- особлива будівля локації (див. Landmarks.luau)
+local function buildLandmark(zone: number, center: Vector3): boolean
+	local recipe = Landmarks[zone]
+	if not recipe then
+		return false
+	end
+	nextBuilding += 1
+	local id = nextBuilding
+	-- спершу збираємо всі клітинки (пізніший колір перекриває попередній), потім ставимо блоки
+	local cells: { [string]: { pos: Vector3, color: Color3 } } = {}
+	recipe(function(x: number, y: number, z: number, color: Color3)
+		cells[x .. "," .. y .. "," .. z] = { pos = center + Vector3.new(x * B, B / 2 + y * B, z * B), color = color }
+	end, Config.Zones[zone])
+	local count = 0
+	for _, c in cells do
+		spawnBlock(zone, CFrame.new(c.pos), c.color, id)
+		count += 1
+	end
+	-- особлива будівля дає подвійний бонус
+	buildingValue[id] = math.floor(count * Config.Zones[zone].value * Config.BUILDING_BONUS * 2)
+	return true
+end
+
 ---------------------------------------------------------------- Build map
 local GRASS = Color3.fromRGB(75, 151, 75)
 local WALL = Color3.fromRGB(40, 40, 45)
@@ -297,9 +321,12 @@ for i, zone in Config.Zones do
 	wall(Vector3.new(1, 30, SIZE), Vector3.new((col + 1) * SIZE, 15, cz))
 	wall(Vector3.new(SIZE, 30, 1), Vector3.new(cx, 15, side * (ROAD + SIZE)))
 
-	-- будівлі 2x2 (двері дивляться на дорогу), паркан, бочки між будинками
+	-- будівлі 2x2 (двері дивляться на дорогу); ліва ближня до дороги = особлива будівля
+	local landmarkSlot = Vector3.new(-12, 0, -12 * side)
 	for _, off in { Vector3.new(-12, 0, -12), Vector3.new(12, 0, -12), Vector3.new(-12, 0, 12), Vector3.new(12, 0, 12) } do
-		buildHouse(i, center + off, 4, zone.height, -side)
+		if not (off == landmarkSlot and buildLandmark(i, center + off)) then
+			buildHouse(i, center + off, 4, zone.height, -side)
+		end
 	end
 	buildFence(i, center, 24, side)
 	for _, x in { -12, 0, 12 } do
@@ -329,6 +356,7 @@ for i, zone in Config.Zones do
 end
 
 ---------------------------------------------------------------- Player data
+type Quest = { kind: string, goal: number, progress: number, reward: number }
 type Data = {
 	money: number,
 	bag: number,
@@ -338,19 +366,87 @@ type Data = {
 	zones: { boolean },
 	rebirths: number,
 	destroyed: number,
+	quests: { Quest },
+	lastDay: number,
+	streak: number,
+	receipts: { string },
+	-- ці поля не зберігаються, рахуються заново при кожному вході:
 	autoSell: boolean,
+	x2: boolean,
+	friends: number,
+	mult: number,
+	nextGift: number,
 }
 
 local data: { [Player]: Data } = {}
 local canSave: { [Player]: boolean } = {}
 local lastThrow: { [Player]: number } = {}
+local joinedAt: { [Player]: number } = {}
+local giftsTaken: { [Player]: number } = {}
 
 local store: DataStore? = nil
 pcall(function()
 	store = DataStoreService:GetDataStore("DestroyIt_v1")
 end)
 
-local function freshData(rebirths: number, destroyed: number): Data
+local function notify(plr: Player, text: string)
+	NotifyRemote:FireClient(plr, text)
+end
+
+local function highestZone(d: Data): number
+	local h = 1
+	for i, open in d.zones do
+		if open then
+			h = i
+		end
+	end
+	return h
+end
+
+local function totalMultiplier(d: Data): number
+	local friends = 1 + Config.FRIEND_BONUS * math.min(d.friends, Config.FRIEND_MAX)
+	return Config.multiplier(d.rebirths) * (if d.x2 then 2 else 1) * friends
+end
+
+---------------------------------------------------------------- Квести
+local function questTemplate(kind: string)
+	for _, q in Config.QUESTS do
+		if q.kind == kind then
+			return q
+		end
+	end
+	return nil
+end
+
+-- новий квест того типу, якого зараз немає серед активних
+local function newQuest(d: Data): Quest
+	local active = {}
+	for _, q in d.quests do
+		active[q.kind] = true
+	end
+	local options = {}
+	for _, q in Config.QUESTS do
+		if not active[q.kind] then
+			table.insert(options, q)
+		end
+	end
+	if #options == 0 then
+		options = Config.QUESTS
+	end
+	local q = options[math.random(#options)]
+	local base = Config.rewardBase(highestZone(d))
+	local goal = if q.kind == "sell" then q.goal * base else q.goal
+	return { kind = q.kind, goal = goal, progress = 0, reward = q.reward * base }
+end
+
+local function fillQuests(d: Data)
+	while #d.quests < 3 do
+		table.insert(d.quests, newQuest(d))
+	end
+end
+
+---------------------------------------------------------------- Створення / завантаження / збереження
+local function freshData(): Data
 	local weapons, zones = {}, {}
 	for i in Config.Weapons do
 		weapons[i] = i == 1
@@ -358,23 +454,45 @@ local function freshData(rebirths: number, destroyed: number): Data
 	for i in Config.Zones do
 		zones[i] = i == 1
 	end
-	return { money = 0, bag = 0, bagLevel = 1, weapon = 1, weapons = weapons, zones = zones, rebirths = rebirths, destroyed = destroyed, autoSell = false }
+	local d: Data = {
+		money = 0,
+		bag = 0,
+		bagLevel = 1,
+		weapon = 1,
+		weapons = weapons,
+		zones = zones,
+		rebirths = 0,
+		destroyed = 0,
+		quests = {},
+		lastDay = 0,
+		streak = 0,
+		receipts = {},
+		autoSell = false,
+		x2 = false,
+		friends = 0,
+		mult = 1,
+		nextGift = -1,
+	}
+	fillQuests(d)
+	return d
 end
 
--- акуратно переносимо збережене в нову структуру (якщо змінився Config — нічого не зламається)
+-- акуратно переносимо збережене в нову структуру (якщо змінився Config, нічого не зламається)
 local function fromSaved(saved: any): Data
-	local d = freshData(0, 0)
+	local d = freshData()
 	if type(saved) ~= "table" then
 		return d
 	end
 	local function num(v: any, default: number): number
-		return if type(v) == "number" and v == v then v else default
+		return if type(v) == "number" and v == v and math.abs(v) ~= math.huge then v else default
 	end
 	d.money = math.max(0, num(saved.money, 0))
 	d.bag = math.max(0, num(saved.bag, 0))
 	d.bagLevel = math.clamp(math.floor(num(saved.bagLevel, 1)), 1, #Config.Bags)
 	d.rebirths = math.max(0, math.floor(num(saved.rebirths, 0)))
 	d.destroyed = math.max(0, math.floor(num(saved.destroyed, 0)))
+	d.lastDay = math.floor(num(saved.lastDay, 0))
+	d.streak = math.clamp(math.floor(num(saved.streak, 0)), 0, Config.DAILY_MAX_STREAK)
 	if type(saved.weapons) == "table" then
 		for i in Config.Weapons do
 			d.weapons[i] = i == 1 or saved.weapons[i] == true
@@ -387,28 +505,50 @@ local function fromSaved(saved: any): Data
 	end
 	local w = math.floor(num(saved.weapon, 1))
 	d.weapon = if d.weapons[w] then w else 1
+	if type(saved.receipts) == "table" then
+		for _, r in saved.receipts do
+			if type(r) == "string" then
+				table.insert(d.receipts, r)
+			end
+		end
+	end
+	if type(saved.quests) == "table" then
+		d.quests = {}
+		for _, q in saved.quests do
+			if type(q) == "table" and type(q.kind) == "string" and questTemplate(q.kind) and #d.quests < 3 then
+				local goal = num(q.goal, 0)
+				if goal > 0 then
+					table.insert(d.quests, {
+						kind = q.kind,
+						goal = goal,
+						progress = math.clamp(num(q.progress, 0), 0, goal),
+						reward = math.max(0, num(q.reward, 0)),
+					})
+				end
+			end
+		end
+		fillQuests(d)
+	end
 	return d
 end
 
-local function save(plr: Player)
+-- повертає true, якщо вдалося зберегти
+local function save(plr: Player): boolean
 	local d = data[plr]
 	if not store or not d or not canSave[plr] then
-		return
+		return false
 	end
 	for attempt = 1, 3 do
 		local ok, err = pcall(function()
 			(store :: DataStore):SetAsync("p_" .. plr.UserId, d)
 		end)
 		if ok then
-			return
+			return true
 		end
 		warn("Save failed for", plr.Name, err)
 		task.wait(attempt)
 	end
-end
-
-local function notify(plr: Player, text: string)
-	NotifyRemote:FireClient(plr, text)
+	return false
 end
 
 local function setStat(plr: Player, name: string, value: number)
@@ -419,17 +559,123 @@ local function setStat(plr: Player, name: string, value: number)
 	end
 end
 
+local function giftSecondsLeft(plr: Player): number
+	local gift = Config.GIFTS[(giftsTaken[plr] or 0) + 1]
+	if not gift or not joinedAt[plr] then
+		return -1 -- усі подарунки цієї сесії вже отримано
+	end
+	return math.max(0, gift.minutes * 60 - (os.clock() - joinedAt[plr]))
+end
+
 local function sendState(plr: Player)
 	local d = data[plr]
 	if not d then
 		return
 	end
+	d.mult = totalMultiplier(d)
+	d.nextGift = giftSecondsLeft(plr)
 	StateRemote:FireClient(plr, d)
 	setStat(plr, "Money", d.money)
 	setStat(plr, "Rebirths", d.rebirths)
 	setStat(plr, "Destroyed", d.destroyed)
 end
 
+-- нагорода одразу на баланс (квести, подарунки, щоденна)
+local function reward(plr: Player, d: Data, amount: number, text: string)
+	amount = math.floor(amount * totalMultiplier(d))
+	d.money += amount
+	notify(plr, text .. " +$" .. Config.short(amount))
+end
+
+local function questProgress(plr: Player, d: Data, kind: string, amount: number)
+	if amount <= 0 then
+		return
+	end
+	for i = #d.quests, 1, -1 do
+		local q = d.quests[i]
+		if q.kind == kind then
+			q.progress = math.min(q.goal, q.progress + amount)
+			if q.progress >= q.goal then
+				table.remove(d.quests, i)
+				reward(plr, d, q.reward, "Quest complete!")
+				fillQuests(d)
+			end
+		end
+	end
+end
+
+---------------------------------------------------------------- Щоденна нагорода, подарунки за час, друзі
+local function checkDaily(plr: Player, d: Data)
+	local today = math.floor(os.time() / 86400)
+	if d.lastDay == today then
+		return
+	end
+	d.streak = if d.lastDay == today - 1 then math.min(d.streak + 1, Config.DAILY_MAX_STREAK) else 1
+	d.lastDay = today
+	reward(plr, d, Config.rewardBase(highestZone(d)) * d.streak, "Daily reward (day " .. d.streak .. ")!")
+end
+
+task.spawn(function()
+	while true do
+		task.wait(1)
+		for _, plr in Players:GetPlayers() do
+			local d = data[plr]
+			if d and giftSecondsLeft(plr) == 0 then
+				local n = (giftsTaken[plr] or 0) + 1
+				giftsTaken[plr] = n
+				reward(plr, d, Config.rewardBase(highestZone(d)) * Config.GIFTS[n].mult, "Playtime gift!")
+				sendState(plr)
+			end
+		end
+	end
+end)
+
+local friendCache: { [Player]: { [number]: boolean } } = {}
+local function isFriend(a: Player, b: Player): boolean
+	local cache = friendCache[a]
+	if not cache then
+		cache = {}
+		friendCache[a] = cache
+	end
+	if cache[b.UserId] == nil then
+		local ok, result = pcall(a.IsFriendsWith, a, b.UserId)
+		cache[b.UserId] = ok and result == true
+	end
+	return cache[b.UserId]
+end
+
+local function updateFriends()
+	for _, plr in Players:GetPlayers() do
+		local d = data[plr]
+		if not d then
+			continue
+		end
+		local n = 0
+		for _, other in Players:GetPlayers() do
+			if other ~= plr and isFriend(plr, other) then
+				n += 1
+			end
+		end
+		if n ~= d.friends then
+			if n > d.friends then
+				local percent = math.floor(Config.FRIEND_BONUS * 100 * math.min(n, Config.FRIEND_MAX) + 0.5)
+				notify(plr, "Friend on server! Money +" .. percent .. "%")
+			end
+			d.friends = n
+			sendState(plr)
+		end
+	end
+end
+
+local function ownsPass(plr: Player, id: number): boolean
+	if id == 0 then
+		return false
+	end
+	local ok, result = pcall(MarketplaceService.UserOwnsGamePassAsync, MarketplaceService, plr.UserId, id)
+	return ok and result == true
+end
+
+---------------------------------------------------------------- Вхід / вихід
 Players.PlayerAdded:Connect(function(plr)
 	local stats = Instance.new("Folder")
 	stats.Name = "leaderstats"
@@ -458,15 +704,21 @@ Players.PlayerAdded:Connect(function(plr)
 	end
 	-- якщо завантажити не вдалося, граємо без збереження, щоб не затерти старий прогрес
 	canSave[plr] = ok
-	data[plr] = fromSaved(saved)
-	if Config.AUTO_SELL_PASS_ID ~= 0 then
-		local owns, result = pcall(MarketplaceService.UserOwnsGamePassAsync, MarketplaceService, plr.UserId, Config.AUTO_SELL_PASS_ID)
-		data[plr].autoSell = owns and result == true
+	local d = fromSaved(saved)
+	d.autoSell = ownsPass(plr, Config.AUTO_SELL_PASS_ID)
+	d.x2 = ownsPass(plr, Config.X2_PASS_ID)
+	if not plr.Parent then
+		return
 	end
+	data[plr] = d
+	joinedAt[plr] = os.clock()
+	giftsTaken[plr] = 0
+	checkDaily(plr, d)
 	sendState(plr)
 	if not ok then
 		notify(plr, "Progress will not save this session")
 	end
+	updateFriends()
 end)
 
 Players.PlayerRemoving:Connect(function(plr)
@@ -474,6 +726,10 @@ Players.PlayerRemoving:Connect(function(plr)
 	data[plr] = nil
 	canSave[plr] = nil
 	lastThrow[plr] = nil
+	joinedAt[plr] = nil
+	giftsTaken[plr] = nil
+	friendCache[plr] = nil
+	task.defer(updateFriends)
 end)
 
 game:BindToClose(function()
@@ -494,7 +750,7 @@ end)
 task.spawn(function()
 	while true do
 		task.wait(60)
-		for plr in data do
+		for _, plr in Players:GetPlayers() do
 			task.spawn(save, plr)
 		end
 	end
@@ -507,13 +763,13 @@ local overlap = OverlapParams.new()
 overlap.FilterType = Enum.RaycastFilterType.Include
 overlap.FilterDescendantsInstances = { blocks }
 
--- кладемо гроші в сумку (з урахуванням множника ребьорту і місця в сумці)
+-- кладемо гроші в сумку (з урахуванням множника і місця в сумці)
 local function addToBag(plr: Player, amount: number, pos: Vector3, text: string?)
 	local d = data[plr]
 	if not d or amount <= 0 then
 		return
 	end
-	amount = math.floor(amount * Config.multiplier(d.rebirths))
+	amount = math.floor(amount * totalMultiplier(d))
 	if d.autoSell then
 		d.money += amount
 		EarnedRemote:FireClient(plr, pos, amount, text)
@@ -548,7 +804,9 @@ local function explode(plr: Player, damage: number, radius: number, pos: Vector3
 
 	local earned = 0
 	local flying = 0
-	local broken = 0
+	local blocksBroken = 0
+	local barrels = 0
+	local buildings = 0
 	for _, p in workspace:GetPartBoundsInRadius(pos, radius, overlap) do
 		local zone = p:GetAttribute("Zone")
 		if p.Parent ~= blocks or not d.zones[zone] then
@@ -562,28 +820,35 @@ local function explode(plr: Player, damage: number, radius: number, pos: Vector3
 		end
 
 		local value = Config.Zones[zone].value
-		broken += 1
 		if p:GetAttribute("Barrel") then
 			-- бочка: ланцюговий вибух
+			barrels += 1
 			earned += value * Config.BARREL_VALUE
 			local at = p.Position
 			breakBlock(p, false)
 			task.delay(0.15, explode, plr, Config.Zones[zone].hp * 3, Config.BARREL_RADIUS, at)
 		else
+			blocksBroken += 1
 			earned += value
 			flying += 1
+			local at = p.Position
 			local building = breakBlock(p, flying <= MAX_FLYING)
 			if buildingLeft[building] == 0 then
-				addToBag(plr, buildingValue[building], p.Position + Vector3.new(0, 6, 0), "BUILDING DESTROYED!")
+				buildings += 1
+				addToBag(plr, buildingValue[building], at + Vector3.new(0, 6, 0), "BUILDING DESTROYED!")
 			end
 		end
 	end
 
-	d.destroyed += broken
-	addToBag(plr, earned, pos)
-	if broken > 0 then
-		sendState(plr)
+	if blocksBroken + barrels == 0 then
+		return
 	end
+	d.destroyed += blocksBroken + barrels
+	addToBag(plr, earned, pos)
+	questProgress(plr, d, "blocks", blocksBroken)
+	questProgress(plr, d, "barrels", barrels)
+	questProgress(plr, d, "buildings", buildings)
+	sendState(plr)
 end
 
 local function launch(plr: Player, weapon, from: Vector3, to: Vector3)
@@ -629,7 +894,8 @@ ThrowRemote.OnServerEvent:Connect(function(plr, target)
 
 	local char = plr.Character
 	local root = char and char:FindFirstChild("HumanoidRootPart") :: BasePart?
-	if not root then
+	local humanoid = char and char:FindFirstChildOfClass("Humanoid")
+	if not root or not humanoid or humanoid.Health <= 0 then
 		return
 	end
 	lastThrow[plr] = now
@@ -650,9 +916,11 @@ sellPad.Touched:Connect(function(hit)
 	local plr = Players:GetPlayerFromCharacter(hit.Parent)
 	local d = plr and data[plr]
 	if d and d.bag > 0 then
-		d.money += d.bag
-		notify(plr, "Sold for $" .. d.bag .. "!")
+		local amount = d.bag
+		d.money += amount
 		d.bag = 0
+		notify(plr, "Sold for $" .. Config.short(amount) .. "!")
+		questProgress(plr, d, "sell", amount)
 		sendState(plr)
 	end
 end)
@@ -660,6 +928,24 @@ end)
 local function nearShop(plr: Player): boolean
 	local root = plr.Character and plr.Character:FindFirstChild("HumanoidRootPart") :: BasePart?
 	return root ~= nil and (root.Position - shopPad.Position).Magnitude < 30
+end
+
+-- ребьорт: скидаємо гроші/сумку/зброю/локації, решту залишаємо
+local function doRebirth(plr: Player, d: Data)
+	local n = freshData()
+	n.rebirths = d.rebirths + 1
+	n.destroyed = d.destroyed
+	n.quests = d.quests
+	n.lastDay = d.lastDay
+	n.streak = d.streak
+	n.receipts = d.receipts
+	n.autoSell = d.autoSell
+	n.x2 = d.x2
+	n.friends = d.friends
+	data[plr] = n
+	notify(plr, "REBIRTH! Money x" .. Config.multiplier(n.rebirths))
+	-- стіни знову закриті: повертаємо персонажа на спавн
+	plr:LoadCharacter()
 end
 
 BuyRemote.OnServerEvent:Connect(function(plr, kind, index)
@@ -704,13 +990,9 @@ BuyRemote.OnServerEvent:Connect(function(plr, kind, index)
 		if not nearShop(plr) then
 			notify(plr, "Go to the SHOP at spawn")
 		elseif d.money < price then
-			notify(plr, "Rebirth costs $" .. price)
+			notify(plr, "Rebirth costs $" .. Config.short(price))
 		else
-			data[plr] = freshData(d.rebirths + 1, d.destroyed)
-			data[plr].autoSell = d.autoSell
-			notify(plr, "REBIRTH! Money x" .. Config.multiplier(d.rebirths + 1))
-			-- стіни знову закриті: перезапускаємо персонажа, щоб клієнт оновив їх
-			plr:LoadCharacter()
+			doRebirth(plr, d)
 		end
 	end
 	sendState(plr)
@@ -731,7 +1013,7 @@ for _, gate in gates:GetChildren() do
 		if not d.zones[i - 1] then
 			notify(plr, "Unlock " .. Config.Zones[i - 1].name .. " first")
 		elseif d.money < zone.price then
-			notify(plr, "Need $" .. zone.price)
+			notify(plr, "Need $" .. Config.short(zone.price))
 		else
 			d.money -= zone.price
 			d.zones[i] = true
@@ -741,17 +1023,64 @@ for _, gate in gates:GetChildren() do
 	end)
 end
 
----------------------------------------------------------------- Gamepass: Auto-Sell
+---------------------------------------------------------------- Robux: gamepass'и і developer products
 MarketplaceService.PromptGamePassPurchaseFinished:Connect(function(plr, passId, purchased)
 	local d = data[plr]
-	if d and purchased and passId == Config.AUTO_SELL_PASS_ID and passId ~= 0 then
+	if not d or not purchased or passId == 0 then
+		return
+	end
+	if passId == Config.AUTO_SELL_PASS_ID then
 		d.autoSell = true
 		d.money += d.bag
 		d.bag = 0
 		notify(plr, "Auto-Sell activated! Money goes straight to your balance")
-		sendState(plr)
+	elseif passId == Config.X2_PASS_ID then
+		d.x2 = true
+		notify(plr, "x2 Money activated!")
 	end
+	sendState(plr)
 end)
+
+MarketplaceService.ProcessReceipt = function(info)
+	local plr = Players:GetPlayerByUserId(info.PlayerId)
+	local d = plr and data[plr]
+	if not plr or not d then
+		return Enum.ProductPurchaseDecision.NotProcessedYet -- Roblox повторить, коли гравець зайде
+	end
+	local purchaseId = tostring(info.PurchaseId)
+	if table.find(d.receipts, purchaseId) then
+		return Enum.ProductPurchaseDecision.PurchaseGranted -- вже видано раніше
+	end
+	local product = nil
+	for _, p in Config.PRODUCTS do
+		if p.id ~= 0 and p.id == info.ProductId then
+			product = p
+		end
+	end
+	if not product then
+		return Enum.ProductPurchaseDecision.NotProcessedYet
+	end
+
+	if product.kind == "money" then
+		local amount = math.floor(Config.rewardBase(highestZone(d)) * product.amount)
+		d.money += amount
+		notify(plr, "Thanks for the purchase! +$" .. Config.short(amount))
+	elseif product.kind == "rebirth" then
+		doRebirth(plr, d)
+		d = data[plr]
+	end
+	table.insert(d.receipts, purchaseId)
+	while #d.receipts > 50 do
+		table.remove(d.receipts, 1)
+	end
+	sendState(plr)
+
+	-- якщо збереження доступне, але не вдалося — Roblox повторить пізніше (і прогрес теж не збережеться)
+	if store and canSave[plr] and not save(plr) then
+		return Enum.ProductPurchaseDecision.NotProcessedYet
+	end
+	return Enum.ProductPurchaseDecision.PurchaseGranted
+end
 
 ---------------------------------------------------------------- Таблиця лідерів біля спавну
 -- Глобальна (усі сервери) через OrderedDataStore; якщо недоступна, показує гравців цього сервера.
@@ -802,17 +1131,20 @@ local function refreshBoard()
 	local ok = false
 	if ordered then
 		-- записуємо результати тих, хто зараз у грі
-		for plr, d in data do
-			pcall(function()
-				(ordered :: OrderedDataStore):SetAsync("p_" .. plr.UserId, math.floor(d.destroyed))
-			end)
+		for _, plr in Players:GetPlayers() do
+			local d = data[plr]
+			if d and canSave[plr] then
+				pcall(function()
+					(ordered :: OrderedDataStore):SetAsync("p_" .. plr.UserId, math.floor(d.destroyed))
+				end)
+			end
 		end
 		ok = pcall(function()
 			local page = (ordered :: OrderedDataStore):GetSortedAsync(false, 10):GetCurrentPage()
 			for _, item in page do
 				local id = tonumber(string.sub(item.key, 3))
 				if id then
-					table.insert(entries, { name = nameOf(id), value = item.value })
+					table.insert(entries, { name = nameOf(id), value = Config.short(item.value) })
 				end
 			end
 		end)
@@ -820,10 +1152,10 @@ local function refreshBoard()
 	if not ok then
 		entries = {}
 		for plr, d in data do
-			table.insert(entries, { name = plr.Name, value = d.destroyed })
+			table.insert(entries, { name = plr.Name, raw = d.destroyed, value = Config.short(d.destroyed) })
 		end
 		table.sort(entries, function(a, b)
-			return a.value > b.value
+			return a.raw > b.raw
 		end)
 	end
 	for i, row in rows do
@@ -840,7 +1172,7 @@ task.spawn(function()
 end)
 
 ---------------------------------------------------------------- Адмін-команди (для тестування)
--- Пиши в чат: !money 100000, !unlock, !weapons, !bag, !autosell, !reset
+-- Пиши в чат: !money 100000, !unlock, !weapons, !bag, !autosell, !x2, !reset
 local function isAdmin(plr: Player): boolean
 	return RunService:IsStudio() or plr.UserId == game.CreatorId or table.find(Config.ADMINS, plr.UserId) ~= nil
 end
@@ -865,6 +1197,9 @@ local commands = {
 	autosell = function(d: Data)
 		d.autoSell = not d.autoSell
 	end,
+	x2 = function(d: Data)
+		d.x2 = not d.x2
+	end,
 }
 
 local function onChat(plr: Player, message: string)
@@ -873,11 +1208,11 @@ local function onChat(plr: Player, message: string)
 		return
 	end
 	if cmd == "reset" then
-		data[plr] = freshData(0, 0)
+		data[plr] = freshData()
 	elseif commands[cmd] and data[plr] then
 		commands[cmd](data[plr], arg)
 	else
-		notify(plr, "Commands: !money N, !unlock, !weapons, !bag, !autosell, !reset")
+		notify(plr, "Commands: !money N, !unlock, !weapons, !bag, !autosell, !x2, !reset")
 		return
 	end
 	notify(plr, "Admin: " .. cmd .. " done")

@@ -9,7 +9,7 @@
       "Config": { "$path": "src/shared/Config.luau" }
     },
     "ServerScriptService": {
-      "Server": { "$path": "src/server/Server.server.luau" }
+      "Server": { "$path": "src/server" }
     },
     "StarterPlayer": {
       "StarterPlayerScripts": {

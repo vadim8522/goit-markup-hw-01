@@ -1,0 +1,54 @@
+<!DOCTYPE html><html><head><meta charset="utf-8"><style>
+body{margin:0;background:#111}
+.scene{position:relative;overflow:hidden;font-family:'Arial Black',Impact,sans-serif}
+.sky{position:absolute;inset:0;background:radial-gradient(circle at 50% 60%,#ffe27a 0%,#ff9a2e 22%,#ff4d2e 40%,#3a8de0 41%,#58b4ff 100%)}
+.ground{position:absolute;left:0;right:0;bottom:0;height:28%;background:#4b974b;
+ background-image:radial-gradient(circle,#5aa85a 28%,transparent 30%);background-size:28px 28px}
+.brick{position:absolute;border-radius:4px;box-shadow:inset -4px -6px 0 rgba(0,0,0,.25),inset 3px 3px 0 rgba(255,255,255,.35)}
+.brick:after{content:"";position:absolute;left:18%;top:-22%;width:26%;height:30%;border-radius:40%;background:inherit;filter:brightness(1.1);box-shadow:inset -2px -2px 0 rgba(0,0,0,.2)}
+.title{position:absolute;left:0;right:0;text-align:center;color:#fff;-webkit-text-stroke:6px #1b1b1b;paint-order:stroke fill;
+ text-shadow:0 10px 0 #1b1b1b;transform:rotate(-4deg);letter-spacing:2px}
+.title b{color:#ffcc33}
+.money{position:absolute;color:#6dff7a;-webkit-text-stroke:5px #0c3d14;paint-order:stroke fill;transform:rotate(8deg);text-shadow:0 6px 0 #0c3d14}
+.boom{position:absolute;border-radius:50%;background:radial-gradient(#fffbe0 0%,#ffd23f 30%,#ff7a1a 55%,rgba(255,60,0,0) 72%)}
+.tnt{position:absolute;background:#d8261c;border-radius:10px;color:#ffd23f;font-size:22px;display:flex;align-items:center;justify-content:center;box-shadow:inset -6px 0 0 rgba(0,0,0,.25)}
+</style></head><body>
+<div id="icon" class="scene" style="width:512px;height:512px"></div>
+<div style="height:20px"></div>
+<div id="thumb" class="scene" style="width:1280px;height:720px"></div>
+<script>
+function scene(el,W,H,opts){
+ el.innerHTML='<div class="sky"></div><div class="ground"></div>';
+ const s=W/512;
+ // будинок, що розлітається
+ const hx=W*opts.hx, hy=H*0.72, bs=34*s*opts.k;
+ const cols=['#f5cd30','#f5cd30','#f5cd30','#80bbdb'], roof='#c4281c';
+ for(let r=0;r<5;r++)for(let c=0;c<6;c++){
+   const intact = c<2 || r<1;
+   const b=document.createElement('div');b.className='brick';
+   let x=hx+(c-3)*bs, y=hy-(r+1)*bs*0.8;
+   let rot=0;
+   if(!intact){const a=Math.random()*Math.PI*1.2-Math.PI*1.1;const d=(60+Math.random()*200)*s*opts.k;x+=Math.cos(a)*d+80*s;y+=Math.sin(a)*d-40*s;rot=Math.random()*360}
+   b.style.cssText+=`left:${x}px;top:${y}px;width:${bs}px;height:${bs*0.8}px;background:${r==4?roof:(r%2&&c%3==1?cols[3]:cols[0])};transform:rotate(${rot}deg)`;
+   el.appendChild(b);
+ }
+ // вибух
+ const boom=document.createElement('div');boom.className='boom';const R=opts.boom*s;
+ boom.style.cssText=`left:${hx+20*s-R/2}px;top:${hy-130*s*opts.k-R/2}px;width:${R}px;height:${R}px`;el.appendChild(boom);
+ // ще уламки різних кольорів
+ const pal=['#c4281c','#0d69ac','#f5cd30','#4b974b','#da8541','#f2f3f3'];
+ for(let i=0;i<opts.extra;i++){const b=document.createElement('div');b.className='brick';const w=(18+Math.random()*26)*s;
+  b.style.cssText+=`left:${Math.random()*W}px;top:${Math.random()*H*0.6}px;width:${w}px;height:${w*0.7}px;background:${pal[i%pal.length]};transform:rotate(${Math.random()*360}deg)`;el.appendChild(b)}
+ // бочка TNT
+ const t=document.createElement('div');t.className='tnt';t.textContent='TNT';
+ t.style.cssText=`left:${W*opts.tx}px;top:${H*0.78-70*s}px;width:${54*s}px;height:${70*s}px;font-size:${20*s}px`;el.appendChild(t);
+ // текст
+ const title=document.createElement('div');title.className='title';title.innerHTML='DESTROY <b>IT!</b>';
+ title.style.cssText+=`top:${H*opts.ty}px;font-size:${opts.fs*s}px`;el.appendChild(title);
+ const m=document.createElement('div');m.className='money';m.textContent='+$1,000,000';
+ m.style.cssText+=`left:${W*opts.mx}px;top:${H*opts.my}px;font-size:${opts.ms*s}px`;el.appendChild(m);
+}
+Math.random=(function(seed){return function(){seed=(seed*16807)%2147483647;return (seed-1)/2147483646}})(7);
+scene(document.getElementById('icon'),512,512,{hx:.5,k:1,boom:260,extra:14,tx:.08,ty:.04,fs:84,mx:.42,my:.80,ms:44});
+scene(document.getElementById('thumb'),1280,720,{hx:.62,k:.75,boom:200,extra:22,tx:.12,ty:.06,fs:62,mx:.55,my:.80,ms:30});
+</script></body></html>

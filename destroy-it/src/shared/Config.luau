@@ -58,12 +58,62 @@ Config.BUILDING_BONUS = 0.5
 -- Rebirth: скидає прогрес, але кожен ребьорт дає +1 до множника грошей (x2, x3, ...)
 Config.REBIRTH_PRICE = 1000000 -- ціна першого, далі множиться на номер ребьорту
 
--- Gamepass "Auto-Sell": гроші одразу йдуть на баланс, сумка не потрібна.
--- Створи gamepass на сайті Roblox (Creator Hub -> твоя гра -> Monetization -> Passes) і встав сюди його ID.
-Config.AUTO_SELL_PASS_ID = 0
+-- Подарунки за час у грі (за одну сесію). mult = скільки "базових нагород" дає подарунок.
+Config.GIFTS = {
+	{ minutes = 5, mult = 1 },
+	{ minutes = 15, mult = 3 },
+	{ minutes = 30, mult = 6 },
+}
+
+-- Щоденна нагорода: день 1 = 1 базова нагорода, день 2 = 2, ... до DAILY_MAX_STREAK
+Config.DAILY_MAX_STREAK = 7
+
+-- Квести: у гравця завжди 3 активних. goal = скільки треба, reward = скільки базових нагород дає.
+-- Для "sell" goal множиться на базову нагороду (щоб масштабувалось із прогресом).
+Config.QUESTS = {
+	{ kind = "blocks", text = "Destroy %s blocks", goal = 150, reward = 3 },
+	{ kind = "barrels", text = "Blow up %s TNT barrels", goal = 6, reward = 3 },
+	{ kind = "buildings", text = "Destroy %s buildings", goal = 2, reward = 4 },
+	{ kind = "sell", text = "Sell $%s", goal = 4, reward = 2 },
+}
+
+-- Бонус за друзів на сервері: +10% за кожного, максимум 5 друзів (+50%)
+Config.FRIEND_BONUS = 0.1
+Config.FRIEND_MAX = 5
+
+-- Gamepass'и. Створи їх на create.roblox.com (твоя гра -> Monetization -> Passes) і встав ID.
+Config.AUTO_SELL_PASS_ID = 0 -- гроші одразу на баланс, без сумки
+Config.X2_PASS_ID = 0 -- x2 гроші назавжди
+
+-- Developer Products (можна купувати багато разів). Monetization -> Developer Products.
+-- Для "money" amount множиться на базову нагороду, тож пак завжди корисний.
+Config.PRODUCTS = {
+	{ id = 0, name = "Money Pack", kind = "money", amount = 100 },
+	{ id = 0, name = "Huge Money Pack", kind = "money", amount = 1000 },
+	{ id = 0, name = "Instant Rebirth", kind = "rebirth" },
+}
 
 -- Адміни (UserId), яким дозволені команди !money і т.д. Автор гри і Studio дозволені завжди.
 Config.ADMINS = {}
+
+-- Базова нагорода залежить від найдальшої відкритої локації
+function Config.rewardBase(highestZone: number): number
+	return Config.Zones[highestZone].value * 50
+end
+
+-- 12345 -> "12.3K", 2500000 -> "2.5M"
+function Config.short(n: number): string
+	if n >= 1e12 then
+		return string.format("%.1fT", n / 1e12)
+	elseif n >= 1e9 then
+		return string.format("%.1fB", n / 1e9)
+	elseif n >= 1e6 then
+		return string.format("%.1fM", n / 1e6)
+	elseif n >= 1e4 then
+		return string.format("%.1fK", n / 1e3)
+	end
+	return tostring(math.floor(n))
+end
 
 function Config.multiplier(rebirths: number): number
 	return 1 + rebirths
