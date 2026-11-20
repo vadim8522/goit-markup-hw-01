@@ -2,6 +2,9 @@
   "name": "DestroyIt",
   "tree": {
     "$className": "DataModel",
+    "Workspace": {
+      "$properties": { "StreamingEnabled": false }
+    },
     "ReplicatedStorage": {
       "Config": { "$path": "src/shared/Config.luau" }
     },
