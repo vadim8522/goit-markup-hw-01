@@ -13,6 +13,8 @@ local BuyRemote = remotes:WaitForChild("Buy") :: RemoteEvent
 local StateRemote = remotes:WaitForChild("State") :: RemoteEvent
 local NotifyRemote = remotes:WaitForChild("Notify") :: RemoteEvent
 local ReadyRemote = remotes:WaitForChild("Ready") :: RemoteEvent
+local BoomRemote = remotes:WaitForChild("Boom") :: RemoteEvent
+local EarnedRemote = remotes:WaitForChild("Earned") :: RemoteEvent
 
 local player = Players.LocalPlayer
 local camera = workspace.CurrentCamera
@@ -109,7 +111,7 @@ end
 
 -- крамниця
 local shop = new("Frame", {
-	Size = UDim2.fromOffset(560, 380), Position = UDim2.new(0.5, -280, 0.5, -190),
+	Size = UDim2.fromOffset(560, 440), Position = UDim2.new(0.5, -280, 0.5, -220),
 	BackgroundColor3 = DARK, Visible = false, Parent = gui,
 })
 corner(shop)
@@ -132,7 +134,7 @@ local function column(title: string, x: number): Frame
 		TextColor3 = Color3.new(1, 1, 1), Font = FONT, TextSize = 22, Text = title, Parent = shop,
 	})
 	local list = new("Frame", {
-		Size = UDim2.new(0.5, -20, 1, -90), Position = UDim2.new(x, 10, 0, 80), BackgroundTransparency = 1, Parent = shop,
+		Size = UDim2.new(0.5, -20, 1, -150), Position = UDim2.new(x, 10, 0, 80), BackgroundTransparency = 1, Parent = shop,
 	})
 	new("UIListLayout", { Padding = UDim.new(0, 6), Parent = list })
 	return list
@@ -161,6 +163,16 @@ for i in Config.Weapons do
 	end)
 end
 
+-- ребьорт: скидає прогрес, але гроші множаться
+local rebirthBtn = new("TextButton", {
+	Size = UDim2.new(1, -20, 0, 50), Position = UDim2.new(0, 10, 1, -60), BackgroundColor3 = Color3.fromRGB(150, 60, 220),
+	TextColor3 = Color3.new(1, 1, 1), Font = FONT, TextSize = 18, Text = "REBIRTH", Parent = shop,
+})
+corner(rebirthBtn)
+rebirthBtn.Activated:Connect(function()
+	BuyRemote:FireServer("rebirth", 0)
+end)
+
 ---------------------------------------------------------------- State updates
 local function showToast(text: string)
 	toast.Text = text
@@ -171,26 +183,44 @@ local function showToast(text: string)
 	}):Play()
 end
 
-local function popup(text: string)
-	local label = new("TextLabel", {
-		Size = UDim2.fromOffset(120, 30), Position = UDim2.fromOffset(240, 70), BackgroundTransparency = 1,
-		TextColor3 = Color3.fromRGB(125, 255, 140), TextStrokeTransparency = 0, Font = FONT, TextScaled = true,
-		Text = text, Parent = gui,
+-- "+$5" вилітає над місцем вибуху
+local function worldPopup(pos: Vector3, text: string, big: boolean)
+	local anchor = new("Part", {
+		Anchored = true, CanCollide = false, CanQuery = false, CanTouch = false, Transparency = 1,
+		Size = Vector3.one, Position = pos, Parent = workspace,
 	})
-	TweenService:Create(label, TweenInfo.new(0.8), { Position = UDim2.fromOffset(240, 30), TextTransparency = 1 }):Play()
-	task.delay(0.8, label.Destroy, label)
+	local bb = new("BillboardGui", {
+		Size = UDim2.fromOffset(if big then 360 else 140, if big then 70 else 44), AlwaysOnTop = true, Parent = anchor,
+	})
+	local label = new("TextLabel", {
+		Size = UDim2.fromScale(1, 1), BackgroundTransparency = 1, TextScaled = true, Font = FONT,
+		TextColor3 = if big then Color3.fromRGB(255, 220, 60) else Color3.fromRGB(125, 255, 140),
+		TextStrokeTransparency = 0, Text = text, Parent = bb,
+	})
+	local info = TweenInfo.new(if big then 2 else 1, Enum.EasingStyle.Quad, Enum.EasingDirection.Out)
+	TweenService:Create(bb, info, { StudsOffset = Vector3.new(0, if big then 10 else 6, 0) }):Play()
+	TweenService:Create(label, info, { TextTransparency = 1, TextStrokeTransparency = 1 }):Play()
+	task.delay(info.Time, anchor.Destroy, anchor)
+end
+
+-- тряска камери: сильніше, якщо вибух ближче і більший
+local shake = 0
+local function onBoom(pos: Vector3, radius: number)
+	local dist = (camera.CFrame.Position - pos).Magnitude
+	local power = math.clamp(radius / 6, 0.5, 4) * math.clamp(1 - dist / 150, 0, 1)
+	shake = math.max(shake, power)
 end
 
 local GREEN = Color3.fromRGB(40, 140, 60)
 local GREY = Color3.fromRGB(50, 50, 58)
 
 local function render(newState)
-	if state and newState.bag > state.bag then
-		popup("+$" .. short(newState.bag - state.bag))
-	end
 	state = newState
 
-	moneyLabel.Text = "$" .. short(state.money)
+	local mult = Config.multiplier(state.rebirths)
+	moneyLabel.Text = "$" .. short(state.money) .. (if mult > 1 then "  x" .. mult else "")
+	rebirthBtn.Text = "REBIRTH: $" .. short(Config.rebirthPrice(state.rebirths))
+		.. "  ->  money x" .. Config.multiplier(state.rebirths + 1) .. " (resets progress)"
 	local bag = Config.Bags[state.bagLevel]
 	bagLabel.Text = bag.name .. ": " .. short(state.bag) .. " / " .. short(bag.capacity)
 	barFill.Size = UDim2.fromScale(math.clamp(state.bag / bag.capacity, 0, 1), 1)
@@ -225,12 +255,12 @@ local function render(newState)
 	-- відкриті локації: стіна зникає тільки для цього гравця
 	for i, open in state.zones do
 		local gate = gates:FindFirstChild("Gate" .. i)
-		if gate and open then
-			gate.CanCollide = false
-			gate.Transparency = 1
+		if gate then
+			gate.CanCollide = not open
+			gate.Transparency = if open then 1 else 0
 			local prompt = gate:FindFirstChildOfClass("ProximityPrompt")
 			if prompt then
-				prompt.Enabled = false
+				prompt.Enabled = not open
 			end
 		end
 	end
@@ -238,7 +268,17 @@ end
 
 StateRemote.OnClientEvent:Connect(render)
 NotifyRemote.OnClientEvent:Connect(showToast)
+BoomRemote.OnClientEvent:Connect(onBoom)
+EarnedRemote.OnClientEvent:Connect(function(pos: Vector3, amount: number, text: string?)
+	if text then
+		worldPopup(pos, text .. "\n+$" .. short(amount), true)
+	else
+		worldPopup(pos, "+$" .. short(amount), false)
+	end
+end)
 ReadyRemote:FireServer()
+
+task.delay(2, showToast, "Click to throw dynamite! Destroy buildings, then SELL at spawn")
 
 ProximityPromptService.PromptTriggered:Connect(function(prompt)
 	if prompt.Name == "ShopPrompt" then
@@ -277,6 +317,21 @@ UserInputService.InputBegan:Connect(function(input, processed)
 	local i = input.KeyCode.Value - Enum.KeyCode.One.Value + 1
 	if i >= 1 and i <= #Config.Weapons and state.weapons[i] then
 		BuyRemote:FireServer("weapon", i)
+	end
+end)
+
+---------------------------------------------------------------- Camera shake
+RunService.RenderStepped:Connect(function(dt)
+	local char = player.Character
+	local humanoid = char and char:FindFirstChildOfClass("Humanoid")
+	if not humanoid then
+		return
+	end
+	if shake > 0.01 then
+		humanoid.CameraOffset = Vector3.new(math.random() - 0.5, math.random() - 0.5, math.random() - 0.5) * shake
+		shake = math.max(0, shake - dt * 6)
+	else
+		humanoid.CameraOffset = Vector3.zero
 	end
 end)
 

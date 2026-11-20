@@ -1,8 +1,10 @@
--- Сервер: будує карту, рахує гроші, вибухи, продаж і покупки.
+-- Сервер: будує карту, рахує гроші, вибухи, продаж, покупки, збереження.
 local Players = game:GetService("Players")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local RunService = game:GetService("RunService")
 local Debris = game:GetService("Debris")
+local Lighting = game:GetService("Lighting")
+local DataStoreService = game:GetService("DataStoreService")
 
 local Config = require(ReplicatedStorage:WaitForChild("Config"))
 
@@ -12,6 +14,7 @@ local ROAD = Config.ROAD_HALF
 local COLUMNS = math.ceil(#Config.Zones / 2)
 local END_X = COLUMNS * SIZE -- кінець дороги
 local SPAWN_X = -40 -- центр зони спавну
+local MAX_FLYING = 60 -- скільки уламків максимум літає від одного вибуху (для швидкодії)
 
 ---------------------------------------------------------------- Remotes
 local remotes = Instance.new("Folder")
@@ -27,9 +30,25 @@ end
 
 local ReadyRemote = newRemote("Ready") -- клієнт -> сервер: "я завантажився"
 local ThrowRemote = newRemote("Throw") -- клієнт -> сервер: кинути в точку
-local BuyRemote = newRemote("Buy") -- клієнт -> сервер: купити / вибрати
+local BuyRemote = newRemote("Buy") -- клієнт -> сервер: купити / вибрати / ребьорт
 local StateRemote = newRemote("State") -- сервер -> клієнт: дані гравця
 local NotifyRemote = newRemote("Notify") -- сервер -> клієнт: повідомлення
+local BoomRemote = newRemote("Boom") -- сервер -> всі: вибух (для тряски камери)
+local EarnedRemote = newRemote("Earned") -- сервер -> клієнт: "+$" у точці вибуху
+
+---------------------------------------------------------------- Освітлення: яскравий "іграшковий" світ
+Lighting.ClockTime = 14
+Lighting.Brightness = 3
+Lighting.OutdoorAmbient = Color3.fromRGB(150, 150, 160)
+Lighting.GlobalShadows = true
+local bloom = Instance.new("BloomEffect")
+bloom.Intensity = 0.4
+bloom.Threshold = 1.5
+bloom.Parent = Lighting
+local cc = Instance.new("ColorCorrectionEffect")
+cc.Saturation = 0.2
+cc.Contrast = 0.05
+cc.Parent = Lighting
 
 ---------------------------------------------------------------- Map helpers
 local old = workspace:FindFirstChild("Baseplate")
@@ -49,20 +68,25 @@ local blocks = Instance.new("Folder")
 blocks.Name = "Blocks"
 blocks.Parent = workspace
 
-local function box(size: Vector3, pos: Vector3, color: Color3, material: Enum.Material?, parent: Instance?): Part
+-- лего-вигляд: пластик + пухирці зверху
+local function lego(p: BasePart)
+	p.Material = Enum.Material.Plastic
+	p.TopSurface = Enum.SurfaceType.Studs
+	p.BottomSurface = Enum.SurfaceType.Inlet
+end
+
+local function box(size: Vector3, pos: Vector3, color: Color3, parent: Instance?): Part
 	local p = Instance.new("Part")
 	p.Anchored = true
 	p.Size = size
 	p.Position = pos
 	p.Color = color
-	p.Material = material or Enum.Material.SmoothPlastic
-	p.TopSurface = Enum.SurfaceType.Smooth
-	p.BottomSurface = Enum.SurfaceType.Smooth
+	lego(p)
 	p.Parent = parent or map
 	return p
 end
 
-local function sign(parent: BasePart, text: string, color: Color3, offset: Vector3)
+local function sign(parent: BasePart, text: string, color: Color3, offset: Vector3): BillboardGui
 	local gui = Instance.new("BillboardGui")
 	gui.Size = UDim2.fromOffset(260, 60)
 	gui.StudsOffset = offset
@@ -78,89 +102,151 @@ local function sign(parent: BasePart, text: string, color: Color3, offset: Vecto
 	label.Font = Enum.Font.FredokaOne
 	label.Parent = gui
 	gui.Parent = parent
+	return gui
 end
 
----------------------------------------------------------------- Blocks
-local function spawnBlock(zone: number, cf: CFrame, color: Color3)
+---------------------------------------------------------------- Blocks & buildings
+-- Кожна будівля має id; рахуємо, скільки блоків лишилось, щоб дати бонус за повне руйнування.
+local buildingLeft: { [number]: number } = {}
+local buildingValue: { [number]: number } = {}
+local nextBuilding = 0
+
+local function spawnBlock(zone: number, cf: CFrame, color: Color3, building: number)
 	local p = Instance.new("Part")
 	p.Anchored = true
 	p.Size = Vector3.one * B
 	p.CFrame = cf
-	p.Color = color
-	p.Material = Config.Zones[zone].material
-	p.TopSurface = Enum.SurfaceType.Smooth
-	p.BottomSurface = Enum.SurfaceType.Smooth
+	-- легкий розкид відтінку, щоб було видно окремі цеглинки
+	p.Color = color:Lerp(Color3.new(0, 0, 0), math.random() * 0.08)
+	lego(p)
 	p:SetAttribute("Zone", zone)
 	p:SetAttribute("HP", Config.Zones[zone].hp)
-	p.Parent = blocks
-	-- запам'ятовуємо, як відбудувати
 	p:SetAttribute("BaseColor", color)
+	p:SetAttribute("Building", building)
+	p.Parent = blocks
+	buildingLeft[building] = (buildingLeft[building] or 0) + 1
 end
 
-local function breakBlock(p: BasePart)
+local function spawnBarrel(zone: number, cf: CFrame)
+	local p = Instance.new("Part")
+	p.Shape = Enum.PartType.Cylinder
+	p.Anchored = true
+	p.Size = Vector3.new(4, 3, 3)
+	p.CFrame = cf * CFrame.Angles(0, 0, math.pi / 2) -- циліндр стоїть вертикально
+	p.Color = Color3.fromRGB(220, 30, 30)
+	lego(p)
+	p:SetAttribute("Zone", zone)
+	p:SetAttribute("HP", Config.Zones[zone].hp)
+	p:SetAttribute("Barrel", true)
+	p.Parent = blocks
+	local label = sign(p, "TNT", Color3.fromRGB(255, 230, 0), Vector3.new(0, 3, 0))
+	label.Size = UDim2.fromOffset(80, 30)
+	label.MaxDistance = 60
+end
+
+-- уламок відлітає і зникає, потім блок відбудовується
+local function breakBlock(p: BasePart, fly: boolean)
 	local zone = p:GetAttribute("Zone")
-	local color = p:GetAttribute("BaseColor")
 	local cf = p.CFrame
-	-- уламок відлітає і зникає
-	p.Parent = workspace
-	p.CanQuery = false
-	p.Anchored = false
-	p.AssemblyLinearVelocity = Vector3.new(math.random(-30, 30), math.random(30, 60), math.random(-30, 30))
-	Debris:AddItem(p, 2)
-	task.delay(Config.RESPAWN, spawnBlock, zone, cf, color)
+	local isBarrel = p:GetAttribute("Barrel")
+	local color = p:GetAttribute("BaseColor")
+	local building = p:GetAttribute("Building")
+
+	if fly then
+		p.Parent = workspace
+		p.CanQuery = false
+		p.Anchored = false
+		p.AssemblyLinearVelocity = Vector3.new(math.random(-40, 40), math.random(40, 80), math.random(-40, 40))
+		p.AssemblyAngularVelocity = Vector3.new(math.random(-10, 10), math.random(-10, 10), math.random(-10, 10))
+		Debris:AddItem(p, 3)
+	else
+		p:Destroy()
+	end
+
+	if isBarrel then
+		task.delay(Config.RESPAWN, spawnBarrel, zone, cf * CFrame.Angles(0, 0, -math.pi / 2))
+	else
+		buildingLeft[building] -= 1
+		task.delay(Config.RESPAWN, spawnBlock, zone, cf, color, building)
+	end
+	return building
 end
 
--- будинок: стіни по периметру + повний дах
-local function buildHouse(zone: number, center: Vector3, w: number, h: number)
+-- будинок: стіни по периметру з вікнами і дверима + повний дах
+local function buildHouse(zone: number, center: Vector3, w: number, h: number, frontSide: number)
 	local z = Config.Zones[zone]
+	nextBuilding += 1
+	local id = nextBuilding
+	local count = 0
 	for y = 0, h - 1 do
 		for ix = 0, w - 1 do
 			for iz = 0, w - 1 do
 				local edge = ix == 0 or iz == 0 or ix == w - 1 or iz == w - 1
 				local isRoof = y == h - 1
-				if edge or isRoof then
+				local middle = (ix == 1 or ix == 2) and (iz == 0 or iz == w - 1) or (iz == 1 or iz == 2) and (ix == 0 or ix == w - 1)
+				local front = if frontSide > 0 then iz == w - 1 else iz == 0
+				local isDoor = y == 0 and front and (ix == 1 or ix == 2)
+				if (edge or isRoof) and not isDoor then
 					local pos = center + Vector3.new((ix - (w - 1) / 2) * B, B / 2 + y * B, (iz - (w - 1) / 2) * B)
-					spawnBlock(zone, CFrame.new(pos), if isRoof then z.roof else z.wall)
+					local color = z.wall
+					if isRoof then
+						color = z.roof
+					elseif middle and y > 0 and y % 2 == 1 then
+						color = Config.WINDOW
+					end
+					spawnBlock(zone, CFrame.new(pos), color, id)
+					count += 1
 				end
 			end
 		end
 	end
+	buildingValue[id] = math.floor(count * z.value * Config.BUILDING_BONUS)
 end
 
 -- паркан квадратом навколо будинків, з проходом спереду
 local function buildFence(zone: number, center: Vector3, half: number, side: number)
 	local color = Config.Zones[zone].fence
+	nextBuilding += 1
+	local id = nextBuilding
+	local count = 0
+	local function add(pos: Vector3)
+		spawnBlock(zone, CFrame.new(center + pos), color, id)
+		count += 1
+	end
 	local n = math.floor(half * 2 / B)
 	for i = 0, n do
 		local t = -half + i * B
 		local frontZ = -side * half -- сторона, що дивиться на дорогу
 		if math.abs(t) > 5 then
-			spawnBlock(zone, CFrame.new(center + Vector3.new(t, B / 2, frontZ)), color)
+			add(Vector3.new(t, B / 2, frontZ))
 		end
-		spawnBlock(zone, CFrame.new(center + Vector3.new(t, B / 2, -frontZ)), color)
+		add(Vector3.new(t, B / 2, -frontZ))
 		if i > 0 and i < n then
-			spawnBlock(zone, CFrame.new(center + Vector3.new(-half, B / 2, t)), color)
-			spawnBlock(zone, CFrame.new(center + Vector3.new(half, B / 2, t)), color)
+			add(Vector3.new(-half, B / 2, t))
+			add(Vector3.new(half, B / 2, t))
 		end
 	end
+	buildingValue[id] = math.floor(count * Config.Zones[zone].value * Config.BUILDING_BONUS)
 end
 
 ---------------------------------------------------------------- Build map
-local GRASS = Color3.fromRGB(70, 110, 50)
+local GRASS = Color3.fromRGB(75, 151, 75)
 local WALL = Color3.fromRGB(40, 40, 45)
 local totalDepth = (ROAD + SIZE) * 2
 
 -- земля, дорога, смуги швидкості
-box(Vector3.new(END_X + 80, 2, totalDepth), Vector3.new((END_X - 80) / 2, -1, 0), GRASS, Enum.Material.Grass)
-box(Vector3.new(END_X, 0.2, ROAD * 2), Vector3.new(END_X / 2, 0.1, 0), Color3.fromRGB(45, 45, 50), Enum.Material.Asphalt)
+box(Vector3.new(END_X + 80, 2, totalDepth), Vector3.new((END_X - 80) / 2, -1, 0), GRASS)
+box(Vector3.new(END_X, 0.2, ROAD * 2), Vector3.new(END_X / 2, 0.1, 0), Color3.fromRGB(60, 60, 65))
 for x = 6, END_X - 4, 12 do
-	box(Vector3.new(3, 0.25, ROAD * 2 - 6), Vector3.new(x, 0.15, 0), Color3.fromRGB(30, 180, 255), Enum.Material.Neon)
+	local stripe = box(Vector3.new(3, 0.25, ROAD * 2 - 6), Vector3.new(x, 0.15, 0), Color3.fromRGB(30, 180, 255))
+	stripe.Material = Enum.Material.Neon
 end
 
 -- межі карти
 local function wall(size: Vector3, pos: Vector3)
-	local w = box(size, pos, WALL, Enum.Material.SmoothPlastic)
-	w.Transparency = 0.6
+	local w = box(size, pos, WALL)
+	w.Material = Enum.Material.SmoothPlastic
+	w.Transparency = 0.7
 	w.CanQuery = false -- кліки проходять крізь стіни
 end
 wall(Vector3.new(2, 30, totalDepth), Vector3.new(-80, 15, 0))
@@ -172,24 +258,27 @@ wall(Vector3.new(80, 30, 2), Vector3.new(-40, 15, -totalDepth / 2))
 local spawnPoint = Instance.new("SpawnLocation")
 spawnPoint.Anchored = true
 spawnPoint.Size = Vector3.new(10, 1, 10)
-spawnPoint.Position = Vector3.new(SPAWN_X - 15, 0.5, 0)
+-- дивимось праворуч, на першу локацію
+spawnPoint.CFrame = CFrame.lookAt(Vector3.new(SPAWN_X - 15, 0.5, 0), Vector3.new(SPAWN_X + 100, 0.5, 0))
 spawnPoint.Neutral = true
 spawnPoint.Duration = 0
+lego(spawnPoint)
 spawnPoint.Parent = map
 
-local shopPad = box(Vector3.new(14, 1, 14), Vector3.new(SPAWN_X, 0.5, -22), Color3.fromRGB(255, 138, 60), Enum.Material.Neon)
+local shopPad = box(Vector3.new(14, 1, 14), Vector3.new(SPAWN_X, 0.5, -22), Color3.fromRGB(255, 138, 60))
 shopPad.Name = "Shop"
 sign(shopPad, "SHOP", Color3.fromRGB(255, 180, 90), Vector3.new(0, 6, 0))
 local shopPrompt = Instance.new("ProximityPrompt")
 shopPrompt.Name = "ShopPrompt"
 shopPrompt.ActionText = "Open shop"
-shopPrompt.ObjectText = "Bags & Weapons"
+shopPrompt.ObjectText = "Bags, Weapons, Rebirth"
 shopPrompt.HoldDuration = 0
 shopPrompt.MaxActivationDistance = 14
 shopPrompt.RequiresLineOfSight = false
 shopPrompt.Parent = shopPad
 
-local sellPad = box(Vector3.new(14, 1, 14), Vector3.new(SPAWN_X, 0.5, 22), Color3.fromRGB(60, 255, 110), Enum.Material.Neon)
+local sellPad = box(Vector3.new(14, 1, 14), Vector3.new(SPAWN_X, 0.5, 22), Color3.fromRGB(60, 255, 110))
+sellPad.Material = Enum.Material.Neon
 sellPad.Name = "Sell"
 sign(sellPad, "SELL", Color3.fromRGB(120, 255, 150), Vector3.new(0, 6, 0))
 
@@ -201,20 +290,24 @@ for i, zone in Config.Zones do
 	local cz = side * (ROAD + SIZE / 2)
 	local center = Vector3.new(cx, 0.4, cz)
 
-	box(Vector3.new(SIZE, 0.4, SIZE), Vector3.new(cx, 0.2, cz), zone.floor, Enum.Material.Grass)
+	box(Vector3.new(SIZE, 0.4, SIZE), Vector3.new(cx, 0.2, cz), zone.floor)
 	-- бокові та задня стіни
 	wall(Vector3.new(1, 30, SIZE), Vector3.new(col * SIZE, 15, cz))
 	wall(Vector3.new(1, 30, SIZE), Vector3.new((col + 1) * SIZE, 15, cz))
 	wall(Vector3.new(SIZE, 30, 1), Vector3.new(cx, 15, side * (ROAD + SIZE)))
 
-	-- будівлі 2x2 + паркан
+	-- будівлі 2x2 (двері дивляться на дорогу), паркан, бочки між будинками
 	for _, off in { Vector3.new(-12, 0, -12), Vector3.new(12, 0, -12), Vector3.new(-12, 0, 12), Vector3.new(12, 0, 12) } do
-		buildHouse(i, center + off, 4, zone.height)
+		buildHouse(i, center + off, 4, zone.height, -side)
 	end
 	buildFence(i, center, 24, side)
+	for _, x in { -12, 0, 12 } do
+		spawnBarrel(i, CFrame.new(center + Vector3.new(x, 2, 0)))
+	end
 
 	-- вхідна стіна (гейт)
-	local gate = box(Vector3.new(SIZE, 30, 1), Vector3.new(cx, 15, side * ROAD), Color3.fromRGB(220, 40, 40), Enum.Material.ForceField, gates)
+	local gate = box(Vector3.new(SIZE, 30, 1), Vector3.new(cx, 15, side * ROAD), Color3.fromRGB(220, 40, 40), gates)
+	gate.Material = Enum.Material.ForceField
 	gate.Name = "Gate" .. i
 	gate.CanQuery = false
 	local title = i .. ". " .. zone.name
@@ -234,7 +327,7 @@ for i, zone in Config.Zones do
 	end
 end
 
----------------------------------------------------------------- Player data (без збереження)
+---------------------------------------------------------------- Player data
 type Data = {
 	money: number,
 	bag: number,
@@ -242,13 +335,86 @@ type Data = {
 	weapon: number,
 	weapons: { boolean },
 	zones: { boolean },
+	rebirths: number,
+	destroyed: number,
 }
 
 local data: { [Player]: Data } = {}
+local canSave: { [Player]: boolean } = {}
 local lastThrow: { [Player]: number } = {}
+
+local store: DataStore? = nil
+pcall(function()
+	store = DataStoreService:GetDataStore("DestroyIt_v1")
+end)
+
+local function freshData(rebirths: number, destroyed: number): Data
+	local weapons, zones = {}, {}
+	for i in Config.Weapons do
+		weapons[i] = i == 1
+	end
+	for i in Config.Zones do
+		zones[i] = i == 1
+	end
+	return { money = 0, bag = 0, bagLevel = 1, weapon = 1, weapons = weapons, zones = zones, rebirths = rebirths, destroyed = destroyed }
+end
+
+-- акуратно переносимо збережене в нову структуру (якщо змінився Config — нічого не зламається)
+local function fromSaved(saved: any): Data
+	local d = freshData(0, 0)
+	if type(saved) ~= "table" then
+		return d
+	end
+	local function num(v: any, default: number): number
+		return if type(v) == "number" and v == v then v else default
+	end
+	d.money = math.max(0, num(saved.money, 0))
+	d.bag = math.max(0, num(saved.bag, 0))
+	d.bagLevel = math.clamp(math.floor(num(saved.bagLevel, 1)), 1, #Config.Bags)
+	d.rebirths = math.max(0, math.floor(num(saved.rebirths, 0)))
+	d.destroyed = math.max(0, math.floor(num(saved.destroyed, 0)))
+	if type(saved.weapons) == "table" then
+		for i in Config.Weapons do
+			d.weapons[i] = i == 1 or saved.weapons[i] == true
+		end
+	end
+	if type(saved.zones) == "table" then
+		for i in Config.Zones do
+			d.zones[i] = i == 1 or saved.zones[i] == true
+		end
+	end
+	local w = math.floor(num(saved.weapon, 1))
+	d.weapon = if d.weapons[w] then w else 1
+	return d
+end
+
+local function save(plr: Player)
+	local d = data[plr]
+	if not store or not d or not canSave[plr] then
+		return
+	end
+	for attempt = 1, 3 do
+		local ok, err = pcall(function()
+			(store :: DataStore):SetAsync("p_" .. plr.UserId, d)
+		end)
+		if ok then
+			return
+		end
+		warn("Save failed for", plr.Name, err)
+		task.wait(attempt)
+	end
+end
 
 local function notify(plr: Player, text: string)
 	NotifyRemote:FireClient(plr, text)
+end
+
+local function setStat(plr: Player, name: string, value: number)
+	local stats = plr:FindFirstChild("leaderstats")
+	local v = stats and stats:FindFirstChild(name)
+	if v then
+		(v :: IntValue).Value = value
+	end
 end
 
 local function sendState(plr: Player)
@@ -257,34 +423,75 @@ local function sendState(plr: Player)
 		return
 	end
 	StateRemote:FireClient(plr, d)
-	local stats = plr:FindFirstChild("leaderstats")
-	local money = stats and stats:FindFirstChild("Money")
-	if money then
-		(money :: IntValue).Value = d.money
-	end
+	setStat(plr, "Money", d.money)
+	setStat(plr, "Rebirths", d.rebirths)
+	setStat(plr, "Destroyed", d.destroyed)
 end
 
 Players.PlayerAdded:Connect(function(plr)
-	local weapons, zones = {}, {}
-	for i in Config.Weapons do
-		weapons[i] = i == 1
-	end
-	for i in Config.Zones do
-		zones[i] = i == 1
-	end
-	data[plr] = { money = 0, bag = 0, bagLevel = 1, weapon = 1, weapons = weapons, zones = zones }
-
 	local stats = Instance.new("Folder")
 	stats.Name = "leaderstats"
-	local money = Instance.new("IntValue")
-	money.Name = "Money"
-	money.Parent = stats
+	for _, name in { "Money", "Rebirths", "Destroyed" } do
+		local v = Instance.new("IntValue")
+		v.Name = name
+		v.Parent = stats
+	end
 	stats.Parent = plr
+
+	local saved = nil
+	local ok = store ~= nil
+	if store then
+		for attempt = 1, 3 do
+			ok, saved = pcall(function()
+				return (store :: DataStore):GetAsync("p_" .. plr.UserId)
+			end)
+			if ok then
+				break
+			end
+			task.wait(attempt)
+		end
+	end
+	if not plr.Parent then
+		return
+	end
+	-- якщо завантажити не вдалося, граємо без збереження, щоб не затерти старий прогрес
+	canSave[plr] = ok
+	data[plr] = fromSaved(saved)
+	sendState(plr)
+	if not ok then
+		notify(plr, "Progress will not save this session")
+	end
 end)
 
 Players.PlayerRemoving:Connect(function(plr)
+	save(plr)
 	data[plr] = nil
+	canSave[plr] = nil
 	lastThrow[plr] = nil
+end)
+
+game:BindToClose(function()
+	local running = 0
+	for plr in data do
+		running += 1
+		task.spawn(function()
+			save(plr)
+			running -= 1
+		end)
+	end
+	local start = os.clock()
+	while running > 0 and os.clock() - start < 25 do
+		task.wait(0.1)
+	end
+end)
+
+task.spawn(function()
+	while true do
+		task.wait(60)
+		for plr in data do
+			task.spawn(save, plr)
+		end
+	end
 end)
 
 ReadyRemote.OnServerEvent:Connect(sendState)
@@ -294,13 +501,34 @@ local overlap = OverlapParams.new()
 overlap.FilterType = Enum.RaycastFilterType.Include
 overlap.FilterDescendantsInstances = { blocks }
 
-local function explode(plr: Player, weapon, pos: Vector3)
+-- кладемо гроші в сумку (з урахуванням множника ребьорту і місця в сумці)
+local function addToBag(plr: Player, amount: number, pos: Vector3, text: string?)
+	local d = data[plr]
+	if not d or amount <= 0 then
+		return
+	end
+	amount = math.floor(amount * Config.multiplier(d.rebirths))
+	local free = Config.Bags[d.bagLevel].capacity - d.bag
+	if free <= 0 then
+		notify(plr, "Bag is full! Go SELL at spawn")
+		return
+	end
+	local added = math.min(amount, free)
+	d.bag += added
+	EarnedRemote:FireClient(plr, pos, added, text)
+	if added < amount then
+		notify(plr, "Bag is full! Go SELL at spawn")
+	end
+end
+
+local function explode(plr: Player, damage: number, radius: number, pos: Vector3)
 	local e = Instance.new("Explosion")
 	e.Position = pos
-	e.BlastRadius = weapon.radius
+	e.BlastRadius = radius
 	e.BlastPressure = 0 -- нікого не відкидає
 	e.DestroyJointRadiusPercent = 0 -- нікого не вбиває
 	e.Parent = workspace
+	BoomRemote:FireAllClients(pos, radius)
 
 	local d = data[plr]
 	if not d then
@@ -308,28 +536,41 @@ local function explode(plr: Player, weapon, pos: Vector3)
 	end
 
 	local earned = 0
-	for _, p in workspace:GetPartBoundsInRadius(pos, weapon.radius, overlap) do
+	local flying = 0
+	local broken = 0
+	for _, p in workspace:GetPartBoundsInRadius(pos, radius, overlap) do
 		local zone = p:GetAttribute("Zone")
 		if p.Parent ~= blocks or not d.zones[zone] then
 			continue -- закриті локації не ламаються
 		end
-		local hp = p:GetAttribute("HP") - weapon.damage
-		if hp <= 0 then
-			earned += Config.Zones[zone].value
-			breakBlock(p)
-		else
+		local hp = p:GetAttribute("HP") - damage
+		if hp > 0 then
 			p:SetAttribute("HP", hp)
 			p.Color = p.Color:Lerp(Color3.new(0, 0, 0), 0.3)
+			continue
+		end
+
+		local value = Config.Zones[zone].value
+		broken += 1
+		if p:GetAttribute("Barrel") then
+			-- бочка: ланцюговий вибух
+			earned += value * Config.BARREL_VALUE
+			local at = p.Position
+			breakBlock(p, false)
+			task.delay(0.15, explode, plr, Config.Zones[zone].hp * 3, Config.BARREL_RADIUS, at)
+		else
+			earned += value
+			flying += 1
+			local building = breakBlock(p, flying <= MAX_FLYING)
+			if buildingLeft[building] == 0 then
+				addToBag(plr, buildingValue[building], p.Position + Vector3.new(0, 6, 0), "BUILDING DESTROYED!")
+			end
 		end
 	end
 
-	if earned > 0 then
-		local free = Config.Bags[d.bagLevel].capacity - d.bag
-		if free <= 0 then
-			notify(plr, "Bag is full! Go sell at spawn")
-			return
-		end
-		d.bag += math.min(earned, free)
+	d.destroyed += broken
+	addToBag(plr, earned, pos)
+	if broken > 0 then
 		sendState(plr)
 	end
 end
@@ -338,7 +579,7 @@ local function launch(plr: Player, weapon, from: Vector3, to: Vector3)
 	local proj = Instance.new("Part")
 	proj.Size = Vector3.new(0.8, 0.8, 1.6)
 	proj.Color = weapon.color
-	proj.Material = Enum.Material.Neon
+	lego(proj)
 	proj.Anchored = true
 	proj.CanCollide = false
 	proj.CanQuery = false
@@ -359,7 +600,7 @@ local function launch(plr: Player, weapon, from: Vector3, to: Vector3)
 		if a >= 1 then
 			conn:Disconnect()
 			proj:Destroy()
-			explode(plr, weapon, to)
+			explode(plr, weapon.damage, weapon.radius, to)
 		end
 	end)
 end
@@ -393,13 +634,13 @@ ThrowRemote.OnServerEvent:Connect(function(plr, target)
 	launch(plr, weapon, from, target)
 end)
 
----------------------------------------------------------------- Sell, shop, gates
+---------------------------------------------------------------- Sell, shop, rebirth, gates
 sellPad.Touched:Connect(function(hit)
 	local plr = Players:GetPlayerFromCharacter(hit.Parent)
 	local d = plr and data[plr]
 	if d and d.bag > 0 then
 		d.money += d.bag
-		notify(plr, "Sold for $" .. d.bag)
+		notify(plr, "Sold for $" .. d.bag .. "!")
 		d.bag = 0
 		sendState(plr)
 	end
@@ -424,7 +665,7 @@ BuyRemote.OnServerEvent:Connect(function(plr, kind, index)
 		if d.weapons[index] then
 			d.weapon = index -- вже куплено: просто вибрати
 		elseif not nearShop(plr) then
-			notify(plr, "Go to the shop at spawn")
+			notify(plr, "Go to the SHOP at spawn")
 		elseif d.money < weapon.price then
 			notify(plr, "Not enough money")
 		else
@@ -439,13 +680,25 @@ BuyRemote.OnServerEvent:Connect(function(plr, kind, index)
 			return
 		end
 		if not nearShop(plr) then
-			notify(plr, "Go to the shop at spawn")
+			notify(plr, "Go to the SHOP at spawn")
 		elseif d.money < bag.price then
 			notify(plr, "Not enough money")
 		else
 			d.money -= bag.price
 			d.bagLevel = index
 			notify(plr, "New bag: " .. bag.name .. "!")
+		end
+	elseif kind == "rebirth" then
+		local price = Config.rebirthPrice(d.rebirths)
+		if not nearShop(plr) then
+			notify(plr, "Go to the SHOP at spawn")
+		elseif d.money < price then
+			notify(plr, "Rebirth costs $" .. price)
+		else
+			data[plr] = freshData(d.rebirths + 1, d.destroyed)
+			notify(plr, "REBIRTH! Money x" .. Config.multiplier(d.rebirths + 1))
+			-- стіни знову закриті: перезапускаємо персонажа, щоб клієнт оновив їх
+			plr:LoadCharacter()
 		end
 	end
 	sendState(plr)
