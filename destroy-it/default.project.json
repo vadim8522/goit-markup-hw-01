@@ -1,0 +1,17 @@
+{
+  "name": "DestroyIt",
+  "tree": {
+    "$className": "DataModel",
+    "ReplicatedStorage": {
+      "Config": { "$path": "src/shared/Config.luau" }
+    },
+    "ServerScriptService": {
+      "Server": { "$path": "src/server/Server.server.luau" }
+    },
+    "StarterPlayer": {
+      "StarterPlayerScripts": {
+        "Client": { "$path": "src/client/Client.client.luau" }
+      }
+    }
+  }
+}
